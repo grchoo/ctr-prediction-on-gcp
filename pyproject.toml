@@ -1,0 +1,16 @@
+[project]
+name = "ctr-prediction-on-gcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google>=3.0.0",
+    "google-api-python-client>=2.194.0",
+    "google-cloud>=0.34.0",
+    "google-cloud-aiplatform>=1.148.0",
+    "google-cloud-bigquery>=3.41.0",
+    "kfp>=2.16.0",
+    "tensorflow>=2.21.0",
+    "python-dotenv>=1.0.0",
+]
