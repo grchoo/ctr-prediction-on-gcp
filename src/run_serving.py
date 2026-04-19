@@ -21,12 +21,22 @@ def main():
     uri = args.model_uri.rstrip('/')
     
     # 2. Download or copy model artifacts
+    # TF Serving expects contents of SavedModel directly under version folder (/models/name/1/saved_model.pb)
     if uri.startswith("gs://"):
         print(f"📥 Downloading model from {uri} to local temp directory...")
-        subprocess.run(f"gsutil -m cp -r {uri}/* {version_dir}/", shell=True, check=True)
+        # Check if saved_model subfolder exists on GCS (simple check via gsutil)
+        has_subfolder = subprocess.run(f"gsutil -q ls {uri}/saved_model/", shell=True).returncode == 0
+        target_uri = f"{uri}/saved_model/*" if has_subfolder else f"{uri}/*"
+        subprocess.run(f"gsutil -m cp -r {target_uri} {version_dir}/", shell=True, check=True)
     else:
         print(f"📥 Copying local model from {uri} to temp directory...")
-        subprocess.run(f"cp -r {uri}/* {version_dir}/", shell=True, check=True)
+        # Check if saved_model subfolder exists locally
+        subfolder_path = os.path.join(uri, "saved_model")
+        if os.path.exists(subfolder_path) and os.path.isdir(subfolder_path):
+            print(f"🔍 Found 'saved_model' subfolder, copying its contents...")
+            subprocess.run(f"cp -r {subfolder_path}/* {version_dir}/", shell=True, check=True)
+        else:
+            subprocess.run(f"cp -r {uri}/* {version_dir}/", shell=True, check=True)
 
     # 3. Start TF Serving via Docker
     print(f"\n🚀 Starting TF Serving on PORT {args.port}...")

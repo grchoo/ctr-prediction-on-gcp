@@ -1,9 +1,9 @@
 from kfp import dsl
 from kfp.dsl import component, Output, Dataset, Model, Artifact, Metrics, ClassificationMetrics
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 import os
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
+load_dotenv(find_dotenv())
 
 # Get base image from environment variable or use a placeholder for local compilation
 # Do not hardcode your project ID here if uploading to GitHub.
@@ -137,7 +137,7 @@ def train_op(
             processed_features[col] = tf.strings.as_string(features[col])
         for col in NUMERIC_FEATURES:
             processed_features[col] = tf.cast(features[col], tf.float32)
-        return processed_features, tf.cast(labels, tf.float32)
+        return processed_features, tf.reshape(tf.cast(labels, tf.float32), [-1, 1])
 
     def make_dataset(csv_path: str, batch_size: int = 8192, shuffle: bool = True) -> tf.data.Dataset:
         ds = tf.data.experimental.make_csv_dataset(
@@ -201,6 +201,7 @@ def train_op(
     else:
         emb_dim = 32
         inputs, encoded = get_encoded_inputs(constant_emb_dim=emb_dim)
+        # Use Lambda layer to wrap tf.stack for Keras 3 compatibility
         attention_output = tf.keras.layers.Lambda(lambda x: tf.stack(x, axis=1))(encoded)
         for _ in range(3):
             attn_layer = tf.keras.layers.MultiHeadAttention(num_heads=4, key_dim=emb_dim)

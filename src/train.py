@@ -3,9 +3,9 @@ import json
 import os
 from typing import Dict, List
 
-import numpy as numpy
+import numpy as np
 import pandas as pd
-import tensorflow as tensorflow
+import tensorflow as tf
 
 from config import CATEGORICAL_FEATURES, NUMERIC_FEATURES, LABEL
 
@@ -17,7 +17,7 @@ def process_features(features, labels):
         processed_features[col] = tf.strings.as_string(features[col])
     for col in NUMERIC_FEATURES:
         processed_features[col] = tf.cast(features[col], tf.float32)
-    return processed_features, tf.cast(labels, tf.float32)
+    return processed_features, tf.reshape(tf.cast(labels, tf.float32), [-1, 1])
 
 def make_dataset(csv_path: str, batch_size: int = 8192, shuffle: bool = True) -> tf.data.Dataset:
     ds = tf.data.experimental.make_csv_dataset(
@@ -109,7 +109,8 @@ def build_dcn_v2_model(vocab: Dict[str, List[str]]) -> tf.keras.Model:
 def build_autoint_model(vocab: Dict[str, List[str]], emb_dim: int = 32) -> tf.keras.Model:
     inputs, encoded = get_encoded_inputs(vocab, constant_emb_dim=emb_dim)
     
-    stacked_embeddings = tf.stack(encoded, axis=1) # (Batch, Num_Features, Emb_Dim)
+    # Use Lambda layer to wrap tf.stack for Keras 3 compatibility
+    stacked_embeddings = tf.keras.layers.Lambda(lambda x: tf.stack(x, axis=1))(encoded)
     
     attention_output = stacked_embeddings
     for _ in range(3): # 3 Attention layers
@@ -143,6 +144,16 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8192)
     parser.add_argument("--model_type", type=str, choices=["dcn_v2", "autoint"], default="dcn_v2", help="Model architecture")
+    # GPU Memory Growth configuration
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print("Enabled GPU Memory Growth")
+        except RuntimeError as e:
+            print(f"GPU configuration error: {e}")
+
     args = parser.parse_args()
 
     os.makedirs(args.model_dir, exist_ok=True)

@@ -1,102 +1,90 @@
 import argparse
 import json
 import os
-from typing import List, Dict
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from typing import List, Dict, Tuple
+from dotenv import load_dotenv, find_dotenv
 
-import pandas as pandas
+import pandas as pd
 from google.cloud import bigquery
 
 from config import CATEGORICAL_FEATURES, NUMERIC_FEATURES, LABEL, TIME_COL
 
+def get_vocab_for_col(args: Tuple[str, pd.Series]) -> Tuple[str, List[str]]:
+    col_name, series = args
+    # Optimized: use value_counts() instead of Counter
+    vocab = series.astype(str).value_counts().head(50000).index.tolist()
+    return col_name, vocab
+
+load_dotenv(find_dotenv())
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project", required=True)
-    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--project", default=os.getenv("GCP_PROJECT_ID"))
+    parser.add_argument("--dataset", default=os.getenv("DATASET_ID"))
     parser.add_argument("--view", default="avazu_feature")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--sample_rows", type=int, default=2000000)
     args = parser.parse_args()
+
+    if not args.project or not args.dataset:
+        print("Error: project or dataset not set. Check .env or pass as arguments.")
+        return
 
     os.makedirs(args.out_dir, exist_ok=True)
     client = bigquery.Client(project=args.project)
 
     query = f"""
     SELECT * FROM `{args.project}.{args.dataset}.{args.view}`
-    ORDER BY event_ts
+    ORDER BY {TIME_COL}
     LIMIT {args.sample_rows}
     """
     
-    print("Reading data from BigQuery in chunks to prevent OOM...")
+    print(f"Reading {args.sample_rows} rows from BigQuery using Storage Read API...")
+    query_job = client.query(query)
+    # create_bqstorage_client=True enables the Fast Storage Read API (Arrow)
+    df = query_job.to_dataframe(create_bqstorage_client=True)
+    
+    if df.empty:
+        print("No data found.")
+        return
+
+    print(f"Data loaded. Shape: {df.shape}. Processing...")
+    df[TIME_COL] = pd.to_datetime(df[TIME_COL])
+    
+    # Define paths
     train_path = os.path.join(args.out_dir, "train.csv")
     val_path = os.path.join(args.out_dir, "val.csv")
     test_path = os.path.join(args.out_dir, "test.csv")
-    
-    train_end = int(args.sample_rows * 0.8)
-    val_end = int(args.sample_rows * 0.9)
-    
-    from collections import Counter
-    vocab_counts = {col: Counter() for col in CATEGORICAL_FEATURES}
-    
-    current_row = 0
-    query_job = client.query(query)
-    
-    # Write headers for CSV files
-    train_col_written = False
-    val_col_written = False
-    test_col_written = False
-    
-    import pandas as pd
-    
-    for df_chunk in query_job.result(page_size=100000).to_dataframe_iterable():
-        if df_chunk.empty:
-            continue
-            
-        df_chunk[TIME_COL] = pd.to_datetime(df_chunk[TIME_COL])
-        
-        # We don't sort here again because query has ORDER BY, but keeping it robust locally isn't strictly needed
-        # df_chunk = df_chunk.sort_values(TIME_COL)
-        
-        chunk_size = len(df_chunk)
-        start_idx = current_row
-        end_idx = current_row + chunk_size
-        
-        # Accumulate vocab
-        for col in CATEGORICAL_FEATURES:
-            vocab_counts[col].update(df_chunk[col].astype(str).tolist())
-            
-        # Distribute into train/val/test
-        if end_idx <= train_end:
-            df_chunk.to_csv(train_path, index=False, mode='a', header=not train_col_written)
-            train_col_written = True
-        elif start_idx >= train_end and end_idx <= val_end:
-            df_chunk.to_csv(val_path, index=False, mode='a', header=not val_col_written)
-            val_col_written = True
-        elif start_idx >= val_end:
-            df_chunk.to_csv(test_path, index=False, mode='a', header=not test_col_written)
-            test_col_written = True
-        else:
-            # Chunk overlaps splits
-            train_mask = (df_chunk.index + start_idx) < train_end
-            val_mask = ((df_chunk.index + start_idx) >= train_end) & ((df_chunk.index + start_idx) < val_end)
-            test_mask = (df_chunk.index + start_idx) >= val_end
-            
-            if train_mask.any():
-                df_chunk[train_mask].to_csv(train_path, index=False, mode='a', header=not train_col_written)
-                train_col_written = True
-            if val_mask.any():
-                df_chunk[val_mask].to_csv(val_path, index=False, mode='a', header=not val_col_written)
-                val_col_written = True
-            if test_mask.any():
-                df_chunk[test_mask].to_csv(test_path, index=False, mode='a', header=not test_col_written)
-                test_col_written = True
-        current_row += chunk_size
-        print(f"Processed {current_row}/{args.sample_rows} rows...")
 
+    # 1. Parallel Vocab Counting
+    print("Accumulating vocabulary in parallel...")
     vocab = {}
-    for col in CATEGORICAL_FEATURES:
-        vocab[col] = [item[0] for item in vocab_counts[col].most_common(50000)]
+    # Passing only required columns to reduce memory overhead during serialization
+    tasks = [(col, df[col]) for col in CATEGORICAL_FEATURES]
+    
+    with ProcessPoolExecutor(max_workers=min(len(CATEGORICAL_FEATURES), os.cpu_count())) as executor:
+        results = list(executor.map(get_vocab_for_col, tasks))
+        for col_name, col_vocab in results:
+            vocab[col_name] = col_vocab
 
+    # 2. Optimized Splitting and Writing
+    print("Splitting data and writing to CSV...")
+    n = len(df)
+    train_end = int(n * 0.8)
+    val_end = int(n * 0.9)
+
+    df.iloc[:train_end].to_csv(train_path, index=False)
+    print(f"Saved {train_end} rows to {train_path}")
+    
+    df.iloc[train_end:val_end].to_csv(val_path, index=False)
+    print(f"Saved {val_end - train_end} rows to {val_path}")
+    
+    df.iloc[val_end:].to_csv(test_path, index=False)
+    print(f"Saved {n - val_end} rows to {test_path}")
+
+    # 3. Save Metadata
     with open(os.path.join(args.out_dir, "vocab.json"), "w") as f:
         json.dump(vocab, f)
 
@@ -108,7 +96,7 @@ def main():
             "time_col": TIME_COL,
         }, f)
 
-    print("Preprocess completed")
+    print("Preprocess completed successfully")
 
 if __name__ == "__main__":
     main()
